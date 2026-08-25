@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
-import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { randomBytes, randomInt, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import pg from 'pg';
@@ -8,10 +8,12 @@ import pg from 'pg';
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
 const databaseUrl = required('DATABASE_URL');
-const jwtSecret = new TextEncoder().encode(required('JWT_SECRET', 32));
+const jwtSecretValue = required('JWT_SECRET', 32);
+const jwtSecret = new TextEncoder().encode(jwtSecretValue);
 const migrationToken = process.env.MIGRATION_TOKEN || '';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://postgrest:3000';
 const smtpEndpoint = process.env.SMTP_ENDPOINT || '';
+const whatsappEndpoint = process.env.WHATSAPP_ENDPOINT || 'https://cacimboerp.cacimboweb.com/api/send-message-whatsapp';
 const frontendUrl = (process.env.FRONTEND_URL || 'https://www.parapenteangola.com').replace(/\/+$/, '');
 const allowedOrigins = new Set((process.env.CORS_ORIGINS || '')
   .split(',').map((item) => item.trim()).filter(Boolean));
@@ -105,48 +107,130 @@ async function issueSession(user) {
   const profile = await pool.query('SELECT * FROM profiles WHERE id = $1', [user.id]);
   return {
     access_token: accessToken, refresh_token: refreshToken, token_type: 'bearer', expires_in: 3600,
-    user: { id: user.id, email: user.email, role: user.role || 'client', user_metadata: { name: profile.rows[0]?.name || user.name || '' } },
+    user: {
+      id: user.id,
+      email: user.email?.endsWith('@whatsapp.parapenteangola.invalid') ? '' : user.email,
+      phone: user.phone || profile.rows[0]?.phone || '',
+      role: user.role || 'client',
+      user_metadata: { name: profile.rows[0]?.name || user.name || '' },
+    },
   };
 }
 
 async function signUp(req, res, headers) {
   const body = await jsonBody(req);
-  const email = String(body.email || '').trim().toLowerCase();
+  const channel = body.channel === 'whatsapp' ? 'whatsapp' : 'email';
+  const email = channel === 'email' ? String(body.email || body.contact || '').trim().toLowerCase() : '';
+  const phone = channel === 'whatsapp' ? normalizePhone(body.phone || body.contact) : '';
+  const contact = channel === 'email' ? email : phone;
   const password = String(body.password || '');
   const name = String(body.options?.data?.name || body.name || '').trim();
-  if (!/^\S+@\S+\.\S+$/.test(email) || password.length < 8) {
-    return send(res, 422, { message: 'Email inválido ou palavra-passe com menos de 8 caracteres.' }, headers);
+  if (!name || password.length < 8 || (channel === 'email' && !/^\S+@\S+\.\S+$/.test(email)) || (channel === 'whatsapp' && !/^2449\d{8}$/.test(phone))) {
+    return send(res, 422, { message: 'Preencha um nome, um contacto válido e uma palavra-passe com pelo menos 8 caracteres.' }, headers);
   }
-  const id = randomUUID();
+  const existing = channel === 'email'
+    ? await pool.query('SELECT 1 FROM platform_users WHERE lower(email)=lower($1)', [email])
+    : await pool.query("SELECT 1 FROM profiles WHERE regexp_replace(COALESCE(phone,''),'\\D','','g')=$1", [phone]);
+  if (existing.rowCount) return send(res, 409, { message: 'Já existe uma conta com este contacto.' }, headers);
+
+  const recent = await pool.query(
+    `SELECT count(*)::int AS total FROM platform_signup_challenges
+     WHERE contact=$1 AND created_at > now() - interval '15 minutes'`, [contact],
+  );
+  if (recent.rows[0].total >= 3) return send(res, 429, { message: 'Aguarde alguns minutos antes de pedir outro código.' }, headers);
+
+  const challengeId = randomUUID();
+  const code = String(randomInt(100000, 1000000));
   const passwordHash = await bcrypt.hash(password, 12);
+  const codeHash = signupCodeHash(challengeId, code);
+  await pool.query('DELETE FROM platform_signup_challenges WHERE expires_at<=now()');
+  await pool.query(
+    `INSERT INTO platform_signup_challenges
+      (id,channel,contact,email,phone,name,password_hash,code_hash,expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now() + interval '10 minutes')`,
+    [challengeId, channel, contact, email || null, phone || null, name, passwordHash, codeHash],
+  );
+  try {
+    const message = `O seu código de confirmação Parapente Angola é ${code}. Expira em 10 minutos.`;
+    if (channel === 'email') {
+      await sendEmail(email, 'Confirmar registo — Parapente Angola', `<p>${message}</p><p>Se não pediu este registo, ignore esta mensagem.</p>`, challengeId);
+    } else {
+      await sendWhatsApp(phone, message);
+    }
+    return send(res, 200, { data: { challenge_id: challengeId, verification_required: true, channel, contact_hint: maskContact(channel, contact), expires_in: 600 }, error: null }, headers);
+  } catch (error) {
+    await pool.query('DELETE FROM platform_signup_challenges WHERE id=$1', [challengeId]);
+    console.error(`Failed to deliver signup code through ${channel}:`, error.message);
+    return send(res, 502, { message: channel === 'email' ? 'Não foi possível enviar o email de confirmação.' : 'Não foi possível enviar o código pelo WhatsApp.' }, headers);
+  }
+}
+
+function normalizePhone(value) {
+  let digits = String(value || '').replace(/\D/g, '');
+  if (digits.startsWith('00244')) digits = digits.slice(2);
+  if (digits.length === 9 && digits.startsWith('9')) digits = `244${digits}`;
+  return digits;
+}
+
+function signupCodeHash(challengeId, code) {
+  return createHash('sha256').update(`${challengeId}:${code}:${jwtSecretValue}`).digest('hex');
+}
+
+function maskContact(channel, contact) {
+  if (channel === 'whatsapp') return `${contact.slice(0, 5)}***${contact.slice(-3)}`;
+  const [local, domain] = contact.split('@');
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+async function verifySignUp(req, res, headers) {
+  const body = await jsonBody(req);
+  const challengeId = String(body.challenge_id || '');
+  const code = String(body.code || '').replace(/\D/g, '');
+  const challengeResult = await pool.query(
+    'SELECT * FROM platform_signup_challenges WHERE id=$1 AND expires_at>now() FOR UPDATE', [challengeId],
+  );
+  const challenge = challengeResult.rows[0];
+  if (!challenge || challenge.attempts >= 5) return send(res, 400, { message: 'O código é inválido ou expirou.' }, headers);
+  const suppliedHash = Buffer.from(signupCodeHash(challengeId, code), 'hex');
+  const expectedHash = Buffer.from(challenge.code_hash, 'hex');
+  if (suppliedHash.length !== expectedHash.length || !timingSafeEqual(suppliedHash, expectedHash)) {
+    await pool.query('UPDATE platform_signup_challenges SET attempts=attempts+1 WHERE id=$1', [challengeId]);
+    return send(res, 400, { message: 'O código introduzido não está correto.' }, headers);
+  }
+
+  const id = randomUUID();
+  const storedEmail = challenge.email || `${challenge.phone}@whatsapp.parapenteangola.invalid`;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [challenge.contact]);
     const created = await client.query(
-      `INSERT INTO platform_users (id, email, password_hash, role, email_confirmed_at)
-       VALUES ($1,$2,$3,'client',now()) RETURNING id,email,role`,
-      [id, email, passwordHash],
+      `INSERT INTO platform_users (id,email,phone,password_hash,role,email_confirmed_at,phone_confirmed_at)
+       VALUES ($1,$2,$3,$4,'client',$5,$6) RETURNING id,email,phone,role`,
+      [id, storedEmail, challenge.phone, challenge.password_hash, challenge.email ? new Date() : null, challenge.phone ? new Date() : null],
     );
     await client.query(
-      `INSERT INTO profiles (id,name,role,status) VALUES ($1,$2,'client','active')
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
-      [id, name],
+      `INSERT INTO profiles (id,name,phone,role,status) VALUES ($1,$2,$3,'client','active')`,
+      [id, challenge.name, challenge.phone],
     );
+    await client.query('DELETE FROM platform_signup_challenges WHERE id=$1', [challengeId]);
     await client.query('COMMIT');
     return send(res, 200, { data: await issueSession(created.rows[0]), error: null }, headers);
   } catch (error) {
     await client.query('ROLLBACK');
-    if (error.code === '23505') return send(res, 409, { message: 'Já existe uma conta com este email.' }, headers);
+    if (error.code === '23505') return send(res, 409, { message: 'Já existe uma conta com este contacto.' }, headers);
     throw error;
   } finally { client.release(); }
 }
 
 async function signIn(req, res, headers) {
   const body = await jsonBody(req);
-  const email = String(body.email || '').trim().toLowerCase();
+  const identifier = String(body.identifier || body.email || '').trim().toLowerCase();
+  const phone = normalizePhone(identifier);
   const result = await pool.query(
     `SELECT u.*, COALESCE(p.role,u.role,'client') AS effective_role, p.status
-     FROM platform_users u LEFT JOIN profiles p ON p.id=u.id WHERE lower(u.email)=lower($1)`, [email],
+     FROM platform_users u LEFT JOIN profiles p ON p.id=u.id
+     WHERE lower(u.email)=lower($1) OR ($2 <> '' AND regexp_replace(COALESCE(u.phone,p.phone,''),'\\D','','g')=$2)`, [identifier, phone],
   );
   const user = result.rows[0];
   if (!user || !user.password_hash || !(await bcrypt.compare(String(body.password || ''), user.password_hash))) {
@@ -183,7 +267,7 @@ async function currentUser(req, res, headers) {
 }
 
 async function sendEmail(to, subject, html, subjectId) {
-  if (!smtpEndpoint) return;
+  if (!smtpEndpoint) throw new Error('SMTP endpoint is not configured');
   const token = await new SignJWT({ role: 'system', email: to })
     .setProtectedHeader({ alg: 'HS256' }).setSubject(subjectId)
     .setIssuer('parapente-angola-api').setAudience('parapente-angola')
@@ -193,7 +277,17 @@ async function sendEmail(to, subject, html, subjectId) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ to, subject, html }),
   });
-  if (!response.ok) console.error(`SMTP endpoint returned ${response.status}`);
+  if (!response.ok) throw new Error(`SMTP endpoint returned ${response.status}`);
+}
+
+async function sendWhatsApp(phone, message) {
+  if (!whatsappEndpoint) throw new Error('WhatsApp endpoint is not configured');
+  const response = await fetch(whatsappEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message_body: message, number: phone, country: 'AO', country_code: '244' }),
+  });
+  if (!response.ok) throw new Error(`Cacimbo WhatsApp endpoint returned ${response.status}`);
 }
 
 async function recoverPassword(req, res, headers) {
@@ -210,12 +304,16 @@ async function recoverPassword(req, res, headers) {
        VALUES ($1,$2,now() + interval '30 minutes')`, [hash, user.id],
     );
     const resetUrl = `${frontendUrl}/reset-password?token=${encodeURIComponent(raw)}`;
-    await sendEmail(
-      user.email,
-      'Redefinir palavra-passe — Parapente Angola',
-      `<p>Recebemos um pedido para redefinir a sua palavra-passe.</p><p><a href="${resetUrl}">Criar nova palavra-passe</a></p><p>Este link expira em 30 minutos.</p>`,
-      user.id,
-    );
+    try {
+      await sendEmail(
+        user.email,
+        'Redefinir palavra-passe — Parapente Angola',
+        `<p>Recebemos um pedido para redefinir a sua palavra-passe.</p><p><a href="${resetUrl}">Criar nova palavra-passe</a></p><p>Este link expira em 30 minutos.</p>`,
+        user.id,
+      );
+    } catch (error) {
+      console.error('Failed to send password recovery email:', error.message);
+    }
   }
   return send(res, 200, { data: {}, error: null }, headers);
 }
@@ -430,6 +528,7 @@ http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', service: 'parapente-angola-api' }, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup') return await signUp(req, res, headers);
+    if (req.method === 'POST' && url.pathname === '/auth/signup/verify') return await verifySignUp(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/token') return await signIn(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/refresh') return await refresh(req, res, headers);
     if (req.method === 'GET' && url.pathname === '/auth/user') return await currentUser(req, res, headers);
