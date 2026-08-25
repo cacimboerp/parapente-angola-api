@@ -322,7 +322,36 @@ async function initializeDatabase() {
     try {
       const directory = new URL('../db/', import.meta.url);
       const files = (await readdir(directory)).filter((name) => name.endsWith('.sql')).sort();
-      for (const file of files) await pool.query(await readFile(new URL(file, directory), 'utf8'));
+      await pool.query(`CREATE TABLE IF NOT EXISTS platform_schema_migrations (
+        filename text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )`);
+      const [{ rows: migrationRows }, { rows: initializedRows }] = await Promise.all([
+        pool.query('SELECT filename FROM platform_schema_migrations'),
+        pool.query("SELECT to_regclass('public.platform_users') IS NOT NULL AND to_regclass('public.profiles') IS NOT NULL AS initialized"),
+      ]);
+      const applied = new Set(migrationRows.map((row) => row.filename));
+      if (!applied.size && initializedRows[0]?.initialized) {
+        for (const file of files) {
+          await pool.query('INSERT INTO platform_schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [file]);
+          applied.add(file);
+        }
+      }
+      for (const file of files) {
+        if (applied.has(file)) continue;
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(await readFile(new URL(file, directory), 'utf8'));
+          await client.query('INSERT INTO platform_schema_migrations (filename) VALUES ($1)', [file]);
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
       await pool.query("NOTIFY pgrst, 'reload schema'");
       return;
     }
