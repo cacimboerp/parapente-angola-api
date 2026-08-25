@@ -254,6 +254,51 @@ function restTable(pathname) {
   return match?.[1] || '';
 }
 
+function ownerColumn(role, table) {
+  if (table === 'profiles') return 'id';
+  if (role === 'client') return ({
+    activity_bookings: 'client_id', bookings: 'client_id', receipts: 'client_id',
+  })[table] || '';
+  if (['pilot', 'provider'].includes(role)) return ({
+    bookings: 'provider_id', flight_logs: 'pilot_id', pilot_event_log: 'piloto_id',
+  })[table] || '';
+  return '';
+}
+
+function scopedPayload(buffer, column, userId, table) {
+  let parsed;
+  try { parsed = JSON.parse(buffer.toString('utf8')); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') throw Object.assign(new Error('Invalid JSON body'), { status: 400 });
+    row[column] = userId;
+    if (table === 'profiles') {
+      for (const protectedField of ['role', 'status', 'verified', 'commission_percent']) delete row[protectedField];
+    }
+  }
+  return Buffer.from(JSON.stringify(Array.isArray(parsed) ? rows : rows[0]));
+}
+
+async function verifyRelatedOwnership(role, table, buffer, userId) {
+  let relation;
+  if (role === 'client' && table === 'booking_extras') {
+    relation = { source: 'booking_id', sql: 'SELECT id FROM bookings WHERE id = ANY($1::uuid[]) AND client_id = $2' };
+  } else if (['pilot', 'provider'].includes(role) && table === 'flight_evaluations') {
+    relation = { source: 'flight_log_id', sql: 'SELECT id FROM flight_logs WHERE id = ANY($1::uuid[]) AND pilot_id = $2' };
+  } else {
+    return;
+  }
+  let parsed;
+  try { parsed = JSON.parse(buffer.toString('utf8')); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const ids = [...new Set(rows.map((row) => row?.[relation.source]).filter(Boolean))];
+  if (!ids.length) throw Object.assign(new Error('Operação não autorizada.'), { status: 403 });
+  const result = await pool.query(relation.sql, [ids, userId]);
+  if (result.rowCount !== ids.length) throw Object.assign(new Error('Operação não autorizada.'), { status: 403 });
+}
+
 async function proxyRest(req, res, url, headers) {
   const table = restTable(url.pathname);
   const auth = await authenticate(req, req.method === 'GET' || req.method === 'HEAD');
@@ -272,6 +317,9 @@ async function proxyRest(req, res, url, headers) {
     || (!read && ['pilot', 'student', 'aluno', 'provider'].includes(role) && pilotWriteTables.has(table))));
   if (!allowed) return send(res, auth ? 403 : 401, { message: 'Operação não autorizada.' }, headers);
 
+  const scopeColumn = auth && role !== 'admin' ? ownerColumn(role, table) : '';
+  if (scopeColumn && read) url.searchParams.set(scopeColumn, `eq.${auth.sub}`);
+
   const upstreamHeaders = {};
   for (const key of ['content-type', 'prefer', 'range', 'accept', 'accept-profile', 'content-profile']) {
     if (req.headers[key]) upstreamHeaders[key] = req.headers[key];
@@ -279,9 +327,18 @@ async function proxyRest(req, res, url, headers) {
   upstreamHeaders.Authorization = `Bearer ${required('POSTGREST_SERVICE_TOKEN', 32)}`;
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
+  let requestBody = Buffer.concat(chunks);
+  if (auth && role !== 'admin' && !read && !isRpc) {
+    if (scopeColumn) {
+      if (req.method !== 'POST') url.searchParams.set(scopeColumn, `eq.${auth.sub}`);
+      requestBody = scopedPayload(requestBody, scopeColumn, auth.sub, table);
+    } else {
+      await verifyRelatedOwnership(role, table, requestBody, auth.sub);
+    }
+  }
   const response = await fetch(`${postgrestUrl}${url.pathname.replace('/rest/v1', '')}${url.search}`, {
     method: req.method, headers: upstreamHeaders,
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks),
+    body: read ? undefined : requestBody,
   });
   const responseHeaders = { ...headers };
   for (const key of ['content-type', 'content-range', 'preference-applied']) {
