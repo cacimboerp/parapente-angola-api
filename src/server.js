@@ -4,6 +4,7 @@ import { randomBytes, randomInt, randomUUID, createHash, timingSafeEqual } from 
 import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import pg from 'pg';
+import { parseIgc } from './igc.js';
 
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
@@ -180,6 +181,111 @@ function maskContact(channel, contact) {
   if (channel === 'whatsapp') return `${contact.slice(0, 5)}***${contact.slice(-3)}`;
   const [local, domain] = contact.split('@');
   return `${local.slice(0, 2)}***@${domain}`;
+}
+
+async function canManagePilot(auth, pilotId) {
+  if (auth.role === 'admin' || auth.sub === pilotId) return true;
+  return false;
+}
+
+async function getXContestPilot(req, res, headers, pilotId) {
+  const auth = await authenticate(req, true);
+  const canManage = auth ? await canManagePilot(auth, pilotId) : false;
+  const profileResult = await pool.query(
+    `SELECT e.pilot_id,e.external_username,e.external_profile_url,e.fai_id_snapshot,
+            e.consent_public,e.verified_at,e.updated_at,p.name
+     FROM pilot_external_profiles e JOIN profiles p ON p.id=e.pilot_id
+     WHERE e.pilot_id=$1 AND ($2::boolean OR e.consent_public=true)`, [pilotId, canManage],
+  );
+  const externalProfile = profileResult.rows[0] || null;
+  if (!externalProfile && !canManage) return send(res, 200, { data: { profile: null, flights: [], stats: null }, error: null }, headers);
+  const [flightsResult, statsResult] = await Promise.all([pool.query(
+    `SELECT id,flown_at,duration_seconds,distance_km,max_altitude_m,average_speed_kmh,
+            max_speed_kmh,takeoff_lat,takeoff_lon,landing_lat,landing_lon,track_points,
+            igc_filename,signature_present,public,imported_at
+     FROM external_flights WHERE pilot_id=$1 AND ($2::boolean OR public=true)
+     ORDER BY flown_at DESC LIMIT 100`, [pilotId, canManage]), pool.query(
+    `SELECT count(*)::int AS total_flights,COALESCE(sum(distance_km),0)::numeric AS total_distance_km,
+            COALESCE(sum(duration_seconds),0)::bigint AS total_duration_seconds,
+            COALESCE(max(distance_km),0)::numeric AS longest_distance_km,
+            COALESCE(max(max_altitude_m),0)::int AS max_altitude_m
+     FROM external_flights WHERE pilot_id=$1 AND ($2::boolean OR public=true)`, [pilotId, canManage]),
+  ]);
+  const flights = flightsResult.rows;
+  const aggregate = statsResult.rows[0];
+  const stats = aggregate.total_flights ? {
+    total_flights: aggregate.total_flights,
+    total_distance_km: Number(aggregate.total_distance_km),
+    total_duration_seconds: Number(aggregate.total_duration_seconds),
+    longest_distance_km: Number(aggregate.longest_distance_km),
+    max_altitude_m: aggregate.max_altitude_m,
+  } : null;
+  return send(res, 200, { data: { profile: externalProfile, flights, stats }, error: null }, headers);
+}
+
+async function saveXContestPilot(req, res, headers, pilotId) {
+  const auth = await authenticate(req);
+  if (!(await canManagePilot(auth, pilotId))) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  const body = await jsonBody(req);
+  const username = String(body.external_username || '').trim().slice(0, 100) || null;
+  let profileUrl = String(body.external_profile_url || '').trim() || null;
+  if (profileUrl) {
+    try {
+      const parsed = new URL(profileUrl);
+      if (!['xcontest.org', 'www.xcontest.org'].includes(parsed.hostname.toLowerCase()) || parsed.protocol !== 'https:') throw new Error();
+      profileUrl = parsed.toString();
+    } catch { return send(res, 422, { message: 'Indique um URL HTTPS válido do XContest.' }, headers); }
+  }
+  const pilot = await pool.query("SELECT fai_id FROM profiles WHERE id=$1 AND role IN ('pilot','aluno','student')", [pilotId]);
+  if (!pilot.rowCount) return send(res, 404, { message: 'Piloto não encontrado.' }, headers);
+  const result = await pool.query(
+    `INSERT INTO pilot_external_profiles
+      (pilot_id,external_username,external_profile_url,fai_id_snapshot,consent_public,updated_at)
+     VALUES ($1,$2,$3,$4,$5,now())
+     ON CONFLICT (pilot_id) DO UPDATE SET external_username=EXCLUDED.external_username,
+       external_profile_url=EXCLUDED.external_profile_url,fai_id_snapshot=EXCLUDED.fai_id_snapshot,
+       consent_public=EXCLUDED.consent_public,updated_at=now()
+     RETURNING pilot_id,external_username,external_profile_url,fai_id_snapshot,consent_public,verified_at,updated_at`,
+    [pilotId, username, profileUrl, pilot.rows[0].fai_id, body.consent_public === true],
+  );
+  return send(res, 200, { data: result.rows[0], error: null }, headers);
+}
+
+async function importIgcFlight(req, res, headers, pilotId) {
+  const auth = await authenticate(req);
+  if (!(await canManagePilot(auth, pilotId))) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  const body = await jsonBody(req, 2_200_000);
+  const filename = String(body.filename || 'tracklog.igc').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180);
+  if (!filename.toLowerCase().endsWith('.igc')) return send(res, 422, { message: 'Selecione um ficheiro .igc.' }, headers);
+  const parsed = parseIgc(body.content);
+  const checksum = createHash('sha256').update(parsed.normalized).digest('hex');
+  try {
+    const result = await pool.query(
+      `INSERT INTO external_flights
+        (pilot_id,flown_at,duration_seconds,distance_km,max_altitude_m,average_speed_kmh,max_speed_kmh,
+         takeoff_lat,takeoff_lon,landing_lat,landing_lon,track_points,igc_filename,igc_checksum,
+         igc_content,signature_present,public)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       RETURNING id,flown_at,duration_seconds,distance_km,max_altitude_m,average_speed_kmh,max_speed_kmh,
+         igc_filename,signature_present,public,imported_at`,
+      [pilotId, parsed.flownAt, parsed.durationSeconds, parsed.distanceKm, parsed.maxAltitudeM,
+        parsed.averageSpeedKmh, parsed.maxSpeedKmh, parsed.takeoff.lat, parsed.takeoff.lon,
+        parsed.landing.lat, parsed.landing.lon, JSON.stringify(parsed.trackPoints), filename, checksum,
+        parsed.normalized, parsed.signaturePresent, body.public === true],
+    );
+    return send(res, 201, { data: result.rows[0], error: null }, headers);
+  } catch (error) {
+    if (error.code === '23505') return send(res, 409, { message: 'Este ficheiro IGC já foi importado para o piloto.' }, headers);
+    throw error;
+  }
+}
+
+async function deleteIgcFlight(req, res, headers, pilotId, flightId) {
+  const auth = await authenticate(req);
+  if (!(await canManagePilot(auth, pilotId))) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  const result = await pool.query('DELETE FROM external_flights WHERE id=$1 AND pilot_id=$2 RETURNING id', [flightId, pilotId]);
+  if (!result.rowCount) return send(res, 404, { message: 'Voo importado não encontrado.' }, headers);
+  return send(res, 200, { data: result.rows[0], error: null }, headers);
 }
 
 async function verifySignUp(req, res, headers) {
@@ -534,6 +640,13 @@ http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/auth/user') return await currentUser(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/recover') return await recoverPassword(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/password') return await changePassword(req, res, headers);
+    const xcontestPilotMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})$/.exec(url.pathname);
+    if (xcontestPilotMatch && req.method === 'GET') return await getXContestPilot(req, res, headers, xcontestPilotMatch[1]);
+    if (xcontestPilotMatch && req.method === 'PUT') return await saveXContestPilot(req, res, headers, xcontestPilotMatch[1]);
+    const xcontestImportMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})\/flights\/igc$/.exec(url.pathname);
+    if (xcontestImportMatch && req.method === 'POST') return await importIgcFlight(req, res, headers, xcontestImportMatch[1]);
+    const xcontestDeleteMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})\/flights\/([0-9a-f-]{36})$/.exec(url.pathname);
+    if (xcontestDeleteMatch && req.method === 'DELETE') return await deleteIgcFlight(req, res, headers, xcontestDeleteMatch[1], xcontestDeleteMatch[2]);
     if (req.method === 'POST' && url.pathname === '/internal/import') return await importRows(req, res, headers);
     if (url.pathname.startsWith('/rest/v1/')) return await proxyRest(req, res, url, headers);
     return send(res, 404, { message: 'Not found' }, headers);
