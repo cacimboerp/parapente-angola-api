@@ -1,0 +1,14 @@
+{
+  "name": "parapente-angola-api",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "jose": "^6.1.0",
+    "pg": "^8.16.3"
+  }
+}
