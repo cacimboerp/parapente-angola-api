@@ -16,6 +16,7 @@ const postgrestUrl = process.env.POSTGREST_URL || 'http://postgrest:3000';
 const smtpEndpoint = process.env.SMTP_ENDPOINT || '';
 const whatsappEndpoint = process.env.WHATSAPP_ENDPOINT || 'https://cacimboerp.cacimboweb.com/api/send-message-whatsapp';
 const frontendUrl = (process.env.FRONTEND_URL || 'https://www.parapenteangola.com').replace(/\/+$/, '');
+const accessTokenTtlSeconds = Math.min(Math.max(Number(process.env.ACCESS_TOKEN_TTL_SECONDS || 14400), 900), 86400);
 const allowedOrigins = new Set((process.env.CORS_ORIGINS || '')
   .split(',').map((item) => item.trim()).filter(Boolean));
 const pool = new Pool({ connectionString: databaseUrl, max: 10 });
@@ -97,7 +98,7 @@ async function issueSession(user) {
   const accessToken = await new SignJWT({ role: user.role || 'client', email: user.email })
     .setProtectedHeader({ alg: 'HS256' }).setSubject(user.id)
     .setIssuer('parapente-angola-api').setAudience('parapente-angola')
-    .setIssuedAt().setExpirationTime('1h').sign(jwtSecret);
+    .setIssuedAt().setExpirationTime(`${accessTokenTtlSeconds}s`).sign(jwtSecret);
   const refreshToken = randomBytes(48).toString('base64url');
   const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
   await pool.query(
@@ -107,7 +108,7 @@ async function issueSession(user) {
   );
   const profile = await pool.query('SELECT * FROM profiles WHERE id = $1', [user.id]);
   return {
-    access_token: accessToken, refresh_token: refreshToken, token_type: 'bearer', expires_in: 3600,
+    access_token: accessToken, refresh_token: refreshToken, token_type: 'bearer', expires_in: accessTokenTtlSeconds,
     user: {
       id: user.id,
       email: user.email?.endsWith('@whatsapp.parapenteangola.invalid') ? '' : user.email,
@@ -162,7 +163,12 @@ async function signUp(req, res, headers) {
   } catch (error) {
     await pool.query('DELETE FROM platform_signup_challenges WHERE id=$1', [challengeId]);
     console.error(`Failed to deliver signup code through ${channel}:`, error.message);
-    return send(res, 502, { message: channel === 'email' ? 'Não foi possível enviar o email de confirmação.' : 'Não foi possível enviar o código pelo WhatsApp.' }, headers);
+    const message = channel === 'email'
+      ? 'Não foi possível enviar o email de confirmação. Tente novamente dentro de alguns minutos.'
+      : error.status === 429
+        ? 'O serviço WhatsApp está temporariamente limitado. Aguarde alguns minutos ou confirme por email.'
+        : 'Não foi possível enviar o código pelo WhatsApp. Tente novamente ou confirme por email.';
+    return send(res, error.status === 429 ? 503 : 502, { message }, headers);
   }
 }
 
@@ -393,7 +399,122 @@ async function sendWhatsApp(phone, message) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message_body: message, number: phone, country: 'AO', country_code: '244' }),
   });
-  if (!response.ok) throw new Error(`Cacimbo WhatsApp endpoint returned ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`Cacimbo WhatsApp endpoint returned ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+}
+
+const managedProfileFields = [
+  'phone', 'nif', 'location', 'price', 'level', 'flight_hours', 'license_validity', 'cv',
+  'verified', 'license_number', 'fai_id', 'xc_portugal_id', 'emergency_contact_name',
+  'emergency_contact_phone', 'commission_percent', 'fai_certificate_url',
+  'license_certificate_url', 'face_photo_url', 'full_body_photo_url', 'in_flight_photo_url',
+  'pilot_lic_ao', 'level_history',
+];
+
+async function createManagedUser(req, res, headers) {
+  const auth = await authenticate(req);
+  const adminResult = await pool.query(
+    `SELECT COALESCE(p.role,u.role) AS role,p.status FROM platform_users u
+     LEFT JOIN profiles p ON p.id=u.id WHERE u.id=$1`, [auth.sub],
+  );
+  const admin = adminResult.rows[0];
+  if (auth.role !== 'admin' || admin?.role !== 'admin' || admin?.status !== 'active') {
+    return send(res, 403, { message: 'Apenas administradores ativos podem criar utilizadores.' }, headers);
+  }
+  const body = await jsonBody(req);
+  const profileInput = body.profile && typeof body.profile === 'object' ? body.profile : body;
+  const name = String(profileInput.name || body.name || '').trim();
+  const email = String(body.email || profileInput.email || '').trim().toLowerCase();
+  const password = String(body.password || '');
+  const requestedRole = String(body.role || profileInput.role || 'client').toLowerCase();
+  const role = ['admin', 'client', 'pilot', 'aluno', 'student'].includes(requestedRole) ? requestedRole : 'client';
+  const phone = normalizePhone(profileInput.phone || body.phone) || null;
+  if (!name || !/^\S+@\S+\.\S+$/.test(email) || (password && password.length < 8)) {
+    return send(res, 422, { message: 'Indique nome, email válido e uma palavra-passe com pelo menos 8 caracteres, quando utilizada.' }, headers);
+  }
+
+  const id = randomUUID();
+  const passwordHash = password ? await bcrypt.hash(password, 12) : null;
+  const resetToken = password ? '' : randomBytes(40).toString('base64url');
+  const resetHash = resetToken ? createHash('sha256').update(resetToken).digest('hex') : '';
+  const profile = { name, role, status: profileInput.status === 'inactive' ? 'inactive' : 'active' };
+  for (const field of managedProfileFields) {
+    if (profileInput[field] !== undefined && profileInput[field] !== '') profile[field] = profileInput[field];
+  }
+  if (phone) profile.phone = phone;
+
+  const columns = ['id', ...Object.keys(profile)];
+  const values = [id, ...Object.values(profile)];
+  const placeholders = values.map((_, index) => `$${index + 1}`).join(',');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO platform_users (id,email,phone,password_hash,role,email_confirmed_at)
+       VALUES ($1,$2,$3,$4,$5,now())`, [id, email, phone, passwordHash, role],
+    );
+    await client.query(
+      `INSERT INTO profiles (${columns.map((column) => `"${column}"`).join(',')}) VALUES (${placeholders})`, values,
+    );
+    if (resetHash) {
+      await client.query(
+        `INSERT INTO platform_password_resets (token_hash,user_id,expires_at)
+         VALUES ($1,$2,now() + interval '48 hours')`, [resetHash, id],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') return send(res, 409, { message: 'Já existe uma conta com este email ou telefone.' }, headers);
+    throw error;
+  } finally { client.release(); }
+
+  let invitationSent = true;
+  if (resetToken) {
+    const resetUrl = `${frontendUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
+    try {
+      await sendEmail(email, 'Ativar conta — Parapente Angola', `<p>Olá ${name},</p><p>A sua conta foi criada.</p><p><a href="${resetUrl}">Definir palavra-passe e ativar conta</a></p><p>Este link expira em 48 horas.</p>`, id);
+    } catch (error) {
+      invitationSent = false;
+      console.error('Failed to send managed-user invitation:', error.message);
+    }
+  }
+  return send(res, 201, { data: { user: { id, email, role, name }, invitation_sent: invitationSent }, error: null }, headers);
+}
+
+async function updatePilotBookingStatus(req, res, headers, bookingId) {
+  const auth = await authenticate(req);
+  if (!['admin', 'pilot', 'provider'].includes(auth.role)) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  const body = await jsonBody(req);
+  const nextStatus = String(body.status || '');
+  const allowedStatuses = ['confirmed', 'cancelled', 'completed'];
+  if (!allowedStatuses.includes(nextStatus)) return send(res, 422, { message: 'Estado de reserva inválido.' }, headers);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query('SELECT id,provider_id,status FROM bookings WHERE id=$1 FOR UPDATE', [bookingId]);
+    const booking = currentResult.rows[0];
+    if (!booking) { await client.query('ROLLBACK'); return send(res, 404, { message: 'Reserva não encontrada.' }, headers); }
+    if (auth.role !== 'admin' && booking.provider_id !== auth.sub) {
+      await client.query('ROLLBACK');
+      return send(res, 403, { message: 'Esta reserva não está atribuída ao piloto autenticado.' }, headers);
+    }
+    const transitions = { pending: ['confirmed', 'cancelled'], confirmed: ['completed', 'cancelled'] };
+    if (auth.role !== 'admin' && !(transitions[booking.status] || []).includes(nextStatus)) {
+      await client.query('ROLLBACK');
+      return send(res, 409, { message: `Não é possível alterar uma reserva ${booking.status} para ${nextStatus}.` }, headers);
+    }
+    const updated = await client.query('UPDATE bookings SET status=$1,updated_at=now() WHERE id=$2 RETURNING *', [nextStatus, bookingId]);
+    await client.query('COMMIT');
+    return send(res, 200, { data: updated.rows[0], error: null }, headers);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
 }
 
 async function recoverPassword(req, res, headers) {
@@ -640,6 +761,9 @@ http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/auth/user') return await currentUser(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/recover') return await recoverPassword(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/password') return await changePassword(req, res, headers);
+    if (req.method === 'POST' && (url.pathname === '/admin/users' || url.pathname === '/functions/createClient')) return await createManagedUser(req, res, headers);
+    const pilotBookingStatusMatch = /^\/pilot\/bookings\/([0-9a-f-]{36})\/status$/.exec(url.pathname);
+    if (pilotBookingStatusMatch && req.method === 'PATCH') return await updatePilotBookingStatus(req, res, headers, pilotBookingStatusMatch[1]);
     const xcontestPilotMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (xcontestPilotMatch && req.method === 'GET') return await getXContestPilot(req, res, headers, xcontestPilotMatch[1]);
     if (xcontestPilotMatch && req.method === 'PUT') return await saveXContestPilot(req, res, headers, xcontestPilotMatch[1]);
